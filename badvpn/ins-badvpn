@@ -1,6 +1,6 @@
 #!/bin/bash
 #UDP
-REPO="https://github.com/hmz-hh/pp/raw/refs/heads/main/"
+REPO="https://github.com/vxb-hmz/sxwe23rys/raw/refs/heads/main/"
 
 wget -O /usr/bin/badvpn "${REPO}badvpn/badvpn" >/dev/null 2>&1
 chmod +x /usr/bin/badvpn > /dev/null 2>&1

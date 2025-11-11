@@ -1,0 +1,1070 @@
+    #!/usr/bin/env python3
+import subprocess
+import time
+import re
+import threading
+import math
+from collections import defaultdict
+import socket
+import json
+import os
+import asyncio
+import ipaddress
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+CONFIG = {
+    'WHITELISTED_IPS': [
+        '127.0.0.1', '::1',
+        '172.17.0.0/16', '172.18.0.0/16', '172.19.0.0/16',
+        '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22',
+        '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18',
+        '190.93.240.0/20', '188.114.96.0/20', '197.234.240.0/22',
+        '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
+        '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
+        '91.198.2.0/24'
+    ],
+    'BLOCK_DURATION': 3600,
+    'SCORE_THRESHOLD': 10000,
+    'COUNT_THRESHOLD': 10000,
+    'DECAY_RATE': 10.0,
+    'HTTP_REQUEST_THRESHOLD': 15000,
+    'SYN_FLOOD_THRESHOLD': 5000,
+    'ICMP_FLOOD_THRESHOLD': 10000,
+    'UDP_FLOOD_THRESHOLD': float('inf'),
+    'TCP_PUSH_THRESHOLD': 20000,
+    'STATE_FILE': '/root/blocked.json',
+    'TELEGRAM_TOKEN': 'TOKEN8148932566:AAEzsLmdDivHJNtfR90dss7YdE6kNIDDGvs  'OWNER_ID': [5704029768, 7432279779],
+    'RANGE_BLOCK_THRESHOLD': 5,
+    'RANGE_BLOCK_SIZE': 24,
+    'MAX_TELEGRAM_NOTIFICATIONS': 60,
+    'TELEGRAM_COOLDOWN': 10,
+    
+    
+    'RATE_LIMIT_THRESHOLD': 100,
+    'RATE_LIMIT_WINDOW': 6,
+    
+    
+    'BYPASS_PORTS': [],
+
+    'IPSET_NAME': 'ddos_block',
+    'IPSET_RANGE_NAME': 'ddos_block_ranges',
+    'REJECT_MODE': False,
+}
+
+blocked_ips = {}
+blocked_ranges = {}
+ip_stats = defaultdict(lambda: {
+    'last_seen': 0,
+    'score': 0,
+    'counts': defaultdict(int),
+    'timestamps': [],
+    'protocols': defaultdict(list),
+    'blocked': False
+})
+
+bot_instance = None
+bot_loop = None
+whitelisted_networks = []
+last_telegram_notification = 0
+telegram_notification_count = 0
+
+def parse_whitelist():
+    global whitelisted_networks
+    whitelisted_networks = []
+    
+    for ip_or_range in CONFIG['WHITELISTED_IPS']:
+        try:
+            if '/' in ip_or_range:
+                network = ipaddress.ip_network(ip_or_range, strict=False)
+                whitelisted_networks.append(network)
+                print(f"✅ Added network to whitelist: {network}")
+            else:
+                ip = ipaddress.ip_address(ip_or_range)
+                if ip.version == 4:
+                    network = ipaddress.IPv4Network(f"{ip}/32")
+                else:
+                    network = ipaddress.IPv6Network(f"{ip}/128")
+                whitelisted_networks.append(network)
+                print(f"✅ Added single IP to whitelist: {network}")
+        except ValueError as e:
+            print(f"❌ Invalid IP/range in whitelist: {ip_or_range} - {e}")
+
+def is_ip_whitelisted(ip_str):
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        
+        for network in whitelisted_networks:
+            if ip in network:
+                return True, network
+                
+        return False, None
+    except ValueError as e:
+        print(f"❌ Invalid IP format: {ip_str} - {e}")
+        return False, None
+
+
+def setup_ipsets():
+    try:
+        result = subprocess.run(['ipset', 'list', CONFIG['IPSET_NAME']], 
+                              stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+        if result.returncode != 0:
+            subprocess.run(['ipset', 'create', CONFIG['IPSET_NAME'], 'hash:ip', 
+                          'timeout', str(CONFIG['BLOCK_DURATION'])], check=True)
+            print(f"✅ Created ipset: {CONFIG['IPSET_NAME']}")
+        else:
+            print(f"🔄 Using existing ipset: {CONFIG['IPSET_NAME']}")
+        
+        result = subprocess.run(['ipset', 'list', CONFIG['IPSET_RANGE_NAME']], 
+                              stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+        if result.returncode != 0:
+            subprocess.run(['ipset', 'create', CONFIG['IPSET_RANGE_NAME'], 'hash:net', 
+                          'timeout', str(CONFIG['BLOCK_DURATION'])], check=True)
+            print(f"✅ Created ipset: {CONFIG['IPSET_RANGE_NAME']}")
+        else:
+            print(f"🔄 Using existing ipset: {CONFIG['IPSET_RANGE_NAME']}")
+            
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to setup ipsets: {e}")
+        raise
+
+def setup_iptables_with_ipsets():
+    try:
+        subprocess.run(['iptables', '-F', 'INPUT'], check=True)
+        subprocess.run(['iptables', '-F', 'FORWARD'], check=True)
+        
+        if CONFIG['REJECT_MODE']:
+            subprocess.run(['iptables', '-A', 'INPUT', '-m', 'set', '--match-set', 
+                          CONFIG['IPSET_NAME'], 'src', '-j', 'REJECT', '--reject-with', 'icmp-port-unreachable'], check=True)
+            subprocess.run(['iptables', '-A', 'FORWARD', '-m', 'set', '--match-set', 
+                          CONFIG['IPSET_NAME'], 'src', '-j', 'REJECT', '--reject-with', 'icmp-port-unreachable'], check=True)
+            subprocess.run(['iptables', '-A', 'INPUT', '-m', 'set', '--match-set', 
+                          CONFIG['IPSET_RANGE_NAME'], 'src', '-j', 'REJECT', '--reject-with', 'icmp-port-unreachable'], check=True)
+            subprocess.run(['iptables', '-A', 'FORWARD', '-m', 'set', '--match-set', 
+                          CONFIG['IPSET_RANGE_NAME'], 'src', '-j', 'REJECT', '--reject-with', 'icmp-port-unreachable'], check=True)
+        else:
+            subprocess.run(['iptables', '-A', 'INPUT', '-m', 'set', '--match-set', 
+                          CONFIG['IPSET_NAME'], 'src', '-j', 'DROP'], check=True)
+            subprocess.run(['iptables', '-A', 'FORWARD', '-m', 'set', '--match-set', 
+                          CONFIG['IPSET_NAME'], 'src', '-j', 'DROP'], check=True)
+            subprocess.run(['iptables', '-A', 'INPUT', '-m', 'set', '--match-set', 
+                          CONFIG['IPSET_RANGE_NAME'], 'src', '-j', 'DROP'], check=True)
+            subprocess.run(['iptables', '-A', 'FORWARD', '-m', 'set', '--match-set', 
+                          CONFIG['IPSET_RANGE_NAME'], 'src', '-j', 'DROP'], check=True)
+        
+        subprocess.run(['iptables', '-A', 'INPUT', '-m', 'conntrack', 
+                       '--ctstate', 'ESTABLISHED,RELATED', '-j', 'ACCEPT'], check=True)
+        subprocess.run(['iptables', '-A', 'FORWARD', '-m', 'conntrack', 
+                       '--ctstate', 'ESTABLISHED,RELATED', '-j', 'ACCEPT'], check=True)
+        
+        subprocess.run(['iptables', '-A', 'INPUT', '-j', 'ACCEPT'], check=True)
+        subprocess.run(['iptables', '-A', 'FORWARD', '-j', 'ACCEPT'], check=True)
+        
+        print("✅ Configured iptables with ipset support (REJECT mode)" if CONFIG['REJECT_MODE'] else "✅ Configured iptables with ipset support (DROP mode)")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to configure iptables: {e}")
+        raise
+        
+
+def setup():
+    global bot_instance
+    
+    parse_whitelist()
+    os.makedirs(os.path.dirname(CONFIG['STATE_FILE']), exist_ok=True)
+    
+    setup_ipsets()
+    setup_iptables_with_ipsets()
+    
+    if os.path.exists(CONFIG['STATE_FILE']):
+        try:
+            with open(CONFIG['STATE_FILE'], 'r') as f:
+                loaded_data = json.load(f)
+                
+                for item in list(loaded_data.keys()):
+                    if '/' in item:
+                        try:
+                            network = ipaddress.ip_network(item)
+                            is_whitelisted, matching_network = is_ip_whitelisted(str(network.network_address))
+                            if is_whitelisted:
+                                print(f"🔓 Auto-unblocking whitelisted range: {network} (matches {matching_network})")
+                                unblock_ip_range(item)
+                                del loaded_data[item]
+                            else:
+                                blocked_ranges[item] = loaded_data[item]
+                                subprocess.run(['ipset', 'add', CONFIG['IPSET_RANGE_NAME'], item,
+                                              'timeout', str(int(loaded_data[item] + CONFIG['BLOCK_DURATION'] - time.time()))], 
+                                              check=True)
+                        except ValueError as e:
+                            print(f"❌ Invalid network format in state file: {item} - {e}")
+                            del loaded_data[item]
+                    else:
+                        is_whitelisted, matching_network = is_ip_whitelisted(item)
+                        if is_whitelisted:
+                            print(f"🔓 Auto-unblocking whitelisted IP: {item} (matches {matching_network})")
+                            unblock_ip(item)
+                            del loaded_data[item]
+                        else:
+                            blocked_ips[item] = loaded_data[item]
+                            ip_stats[item]['blocked'] = True
+                            subprocess.run(['ipset', 'add', CONFIG['IPSET_NAME'], item,
+                                          'timeout', str(int(loaded_data[item] + CONFIG['BLOCK_DURATION'] - time.time()))], 
+                                          check=True)
+                
+                if len(loaded_data) != (len(blocked_ips) + len(blocked_ranges)):
+                    save_state()
+        except Exception as e:
+            print(f"❌ Error loading state file: {e}")
+    
+    bot_instance = Bot(token=CONFIG['TELEGRAM_TOKEN'])
+    print(f"🛡️ Setup complete with ipset support. Monitoring {len(whitelisted_networks)} whitelisted networks.")
+    
+def check_rate_limit(ip, proto, stats):
+    now = time.time()
+    
+    if proto == 'UDP':
+            return False
+    else:
+        current_window = int(now / CONFIG['RATE_LIMIT_WINDOW'])
+        
+        if 'rate_window' not in stats or stats['rate_window'] != current_window:
+            stats['rate_window'] = current_window
+            stats['window_count'] = 0
+            
+        stats['window_count'] += 1
+        
+        if stats['window_count'] > CONFIG['RATE_LIMIT_THRESHOLD']:
+            stats['score'] += 100
+            return True
+            
+    return False
+
+def execute_iptables_range_command(action, network):
+    network_str = str(network)
+    commands = [
+        ['iptables', action, 'INPUT', '-s', network_str, '-j', 'DROP'],
+        ['iptables', action, 'FORWARD', '-s', network_str, '-j', 'DROP']
+    ]
+    
+    success = True
+    for cmd in commands:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode != 0:
+                print(f"iptables range command failed: {' '.join(cmd)}")
+                print(f"Error: {result.stderr}")
+                success = False
+        except subprocess.TimeoutExpired:
+            print(f"iptables range command timed out: {' '.join(cmd)}")
+            success = False
+        except Exception as e:
+            print(f"Error executing iptables range command: {e}")
+            success = False
+    
+    return success
+
+def execute_iptables_command(action, ip):
+    commands = [
+        ['iptables', action, 'INPUT', '-s', ip, '-j', 'DROP'],
+        ['iptables', action, 'FORWARD', '-s', ip, '-j', 'DROP']
+    ]
+    
+    success = True
+    for cmd in commands:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode != 0:
+                print(f"iptables command failed: {' '.join(cmd)}")
+                print(f"Error: {result.stderr}")
+                success = False
+        except subprocess.TimeoutExpired:
+            print(f"iptables command timed out: {' '.join(cmd)}")
+            success = False
+        except Exception as e:
+            print(f"Error executing iptables command: {e}")
+            success = False
+    
+    return success
+
+def can_send_telegram_notification():
+    global last_telegram_notification, telegram_notification_count
+    
+    current_time = time.time()
+    
+    if current_time - last_telegram_notification > CONFIG['TELEGRAM_COOLDOWN']:
+        telegram_notification_count = 0
+        last_telegram_notification = current_time
+    
+    if telegram_notification_count >= CONFIG['MAX_TELEGRAM_NOTIFICATIONS']:
+        return False
+    
+    telegram_notification_count += 1
+    return True
+
+def send_telegram_message(message, force=False):
+    if not force and not can_send_telegram_notification():
+        print("⚠️ Telegram notification rate limit reached, skipping message")
+        return
+    
+    def send_to_loop():
+        if bot_loop and bot_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                send_telegram_async(message), bot_loop
+            )
+            try:
+                future.result(timeout=10)
+            except Exception as e:
+                print(f"Error sending Telegram message: {str(e)}")
+        else:
+            print(f"Bot loop not available, message: {message}")
+    
+    threading.Thread(target=send_to_loop, daemon=True).start()
+
+async def send_telegram_async(message):
+    try:
+        if bot_instance:
+            for chat_id in CONFIG['OWNER_ID']:
+                await bot_instance.send_message(chat_id=chat_id, text=message)
+        else:
+            print("Bot instance not available")
+    except Exception as e:
+        print(f"Error sending Telegram message: {str(e)}")
+
+def block_ip_range(network):
+    if isinstance(network, str):
+        try:
+            network = ipaddress.ip_network(network)
+        except ValueError as e:
+            print(f"❌ Invalid network format: {network} - {e}")
+            return False
+    
+    for whitelist_net in whitelisted_networks:
+        if network.overlaps(whitelist_net):
+            print(f"🛡️ WHITELIST PROTECTION: Refusing to block range {network} (overlaps with {whitelist_net})")
+            send_telegram_message(f"🛡️ WHITELIST PROTECTION\n\n"
+                                f"Attempted to block range overlapping with whitelist:\n"
+                                f"Block attempt: {network}\n"
+                                f"Whitelist range: {whitelist_net}\n"
+                                f"❌ Block refused for security", force=True)
+            return False
+    
+    network_str = str(network)
+    
+    if network_str not in blocked_ranges:
+        print(f"🎯 Attempting to block IP range: {network_str}")
+        
+        try:
+            # Add to ipset instead of individual iptables rules
+            subprocess.run(['ipset', 'add', CONFIG['IPSET_RANGE_NAME'], network_str,
+                           'timeout', str(CONFIG['BLOCK_DURATION'])], check=True)
+            
+            blocked_ranges[network_str] = time.time()
+            
+            message = f'🚨 IP RANGE BLOCKED: {network_str}\n\n'
+            message += f'📊 Blocked at: {time.strftime("%Y-%m-%d %H:%M:%S")}\n'
+            message += f'⏰ Block Duration: {CONFIG["BLOCK_DURATION"]/3600:.1f} hours\n'
+            message += f'🛡️ Protection covering {network.num_addresses} addresses'
+            
+            print(f"✅ IP range {network_str} blocked successfully in ipset")
+            print(message)
+            
+            send_telegram_message(message)
+            save_state()
+            return True
+        except subprocess.CalledProcessError as e:
+            error_msg = f"❌ Failed to block IP range {network_str} - ipset command failed: {e}"
+            print(error_msg)
+            send_telegram_message(error_msg, force=True)
+            return False
+    return True
+
+def block_ip(ip):
+    is_whitelisted, matching_network = is_ip_whitelisted(ip)
+    
+    if is_whitelisted:
+        print(f"🛡️ WHITELIST PROTECTION: Refusing to block {ip} (matches {matching_network})")
+        send_telegram_message(f"🛡️ WHITELIST PROTECTION\n\n"
+                            f"Attempted to block whitelisted IP: {ip}\n"
+                            f"Matches network: {matching_network}\n"
+                            f"❌ Block refused for security", force=True)
+        return
+    
+    local_ips = get_local_ips()
+    if ip in local_ips:
+        print(f"🏠 LOCAL IP PROTECTION: Refusing to block local IP: {ip}")
+        send_telegram_message(f"🏠 LOCAL IP PROTECTION\n\n"
+                            f"Attempted to block local IP: {ip}\n"
+                            f"❌ Block refused for security", force=True)
+        return
+        
+    if ip in blocked_ips or ip_stats[ip]['blocked']:
+        print(f"ℹ️ IP {ip} is already blocked - skipping duplicate block")
+        return
+        
+    print(f"🎯 Attempting to block IP: {ip}")
+    
+    try:
+        subprocess.run(['ipset', 'add', CONFIG['IPSET_NAME'], ip, 
+                       'timeout', str(CONFIG['BLOCK_DURATION'])], check=True)
+        
+        blocked_ips[ip] = time.time()
+        ip_stats[ip]['blocked'] = True
+        
+        stats = ip_stats[ip]
+        message = f'🚨 IP BLOCKED (host+containers): {ip}\n\n'
+        message += f'📊 Threat Score: {stats["score"]:.1f}\n'
+        message += f'📈 Total Requests: {sum(stats["counts"].values())}\n'
+        message += f'📌 Protocols Detected:\n'
+        
+        target_info = defaultdict(set)
+        current_time = time.time()
+        for proto, timestamps in stats['protocols'].items():
+            for t in timestamps:
+                if current_time - t <= 60:
+                    if 'targets' in stats and proto in stats['targets']:
+                        for target_ip, target_port in stats['targets'][proto]:
+                            target_info[proto].add(f"{target_ip}:{target_port}")
+        
+        for proto, count in stats['counts'].items():
+            message += f'   • {proto}: {count} requests'
+            if proto in target_info:
+                message += f' (Targets: {", ".join(list(target_info[proto])[:3])})'
+            message += '\n'
+        
+        recent_activity = []
+        for proto, timestamps in stats['protocols'].items():
+            recent_count = len([t for t in timestamps if current_time - t <= 60])
+            if recent_count > 0:
+                recent_activity.append(f'{proto}: {recent_count}/min')
+        
+        if recent_activity:
+            message += f'\n⚡ Recent Activity (last minute):\n'
+            for activity in recent_activity:
+                message += f'   • {activity}\n'
+        
+        message += f'\n⏰ Block Duration: {CONFIG["BLOCK_DURATION"]/3600:.1f} hours'
+        message += f'\n🕐 Blocked at: {time.strftime("%Y-%m-%d %H:%M:%S")}'
+        
+        print(f"✅ IP {ip} blocked successfully in ipset")
+        print(message)
+        
+        send_telegram_message(message)
+        check_for_range_block(ip)
+        save_state()
+    except subprocess.CalledProcessError as e:
+        if "already added" in str(e.stderr):
+            print(f"ℹ️ IP {ip} was already in ipset - updating our records")
+            blocked_ips[ip] = time.time()
+            ip_stats[ip]['blocked'] = True
+            save_state()
+        else:
+            error_msg = f"❌ Failed to block IP {ip} - ipset command failed: {e}"
+            print(error_msg)
+            send_telegram_message(error_msg, force=True)
+
+def check_for_range_block(ip):
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        if ip_obj.version != 4:
+            return
+        
+        network_24 = ipaddress.ip_network(f"{ip}/24", strict=False)
+        network_str = str(network_24)
+        
+        blocked_in_range = 0
+        for blocked_ip in blocked_ips:
+            try:
+                if ipaddress.ip_address(blocked_ip) in network_24:
+                    blocked_in_range += 1
+            except ValueError:
+                continue
+        
+        if blocked_in_range >= CONFIG['RANGE_BLOCK_THRESHOLD'] and network_str not in blocked_ranges:
+            print(f"⚠️ Multiple IPs from {network_str} blocked ({blocked_in_range}), considering range block...")
+            
+            range_already_blocked = False
+            for blocked_range in blocked_ranges:
+                try:
+                    blocked_net = ipaddress.ip_network(blocked_range)
+                    if network_24.overlaps(blocked_net):
+                        range_already_blocked = True
+                        break
+                except ValueError:
+                    continue
+            
+            if not range_already_blocked:
+                message = f"⚠️ Multiple IPs from {network_str} blocked ({blocked_in_range})\n"
+                message += f"Considering blocking entire /24 range ({network_str})..."
+                send_telegram_message(message)
+                block_ip_range(network_24)
+    except Exception as e:
+        print(f"Error in range block check for {ip}: {e}")
+
+def unblock_ip_range(network_str):
+    print(f"🔓 Attempting to unblock IP range: {network_str}")
+    
+    try:
+        subprocess.run(['ipset', 'del', CONFIG['IPSET_RANGE_NAME'], network_str], check=True)
+        
+        if network_str in blocked_ranges:
+            del blocked_ranges[network_str]
+        
+        message = f'✅ IP RANGE UNBLOCKED: {network_str}\n'
+        message += f'🕐 Unblocked at: {time.strftime("%Y-%m-%d %H:%M:%S")}'
+        
+        print(f"✅ IP range {network_str} unblocked successfully from ipset")
+        print(message)
+        send_telegram_message(message, force=True)
+        
+        save_state()
+        return True
+    except subprocess.CalledProcessError as e:
+        error_msg = f"❌ Failed to unblock IP range {network_str} - ipset command failed: {e}"
+        print(error_msg)
+        send_telegram_message(error_msg, force=True)
+        return False
+
+def unblock_ip(ip):
+    print(f"🔓 Attempting to unblock IP: {ip}")
+    
+    try:
+        # Remove from ipset
+        subprocess.run(['ipset', 'del', CONFIG['IPSET_NAME'], ip], check=True)
+        
+        if ip in blocked_ips:
+            del blocked_ips[ip]
+        
+        reset_ip_stats(ip)
+        
+        message = f'✅ IP UNBLOCKED (host+containers): {ip}\n'
+        message += f'🔄 Statistics reset - IP can be blocked again if threats detected\n'
+        message += f'🕐 Unblocked at: {time.strftime("%Y-%m-%d %H:%M:%S")}'
+        
+        print(f"✅ IP {ip} unblocked successfully from ipset")
+        print(message)
+        send_telegram_message(message, force=True)
+        
+        save_state()
+        return True
+    except subprocess.CalledProcessError as e:
+        error_msg = f"❌ Failed to unblock IP {ip} - ipset command failed: {e}"
+        print(error_msg)
+        send_telegram_message(error_msg, force=True)
+        return False
+
+def reset_ip_stats(ip):
+    if ip in ip_stats:
+        ip_stats[ip]['score'] = 0
+        ip_stats[ip]['counts'] = defaultdict(int)
+        ip_stats[ip]['timestamps'] = []
+        ip_stats[ip]['protocols'] = defaultdict(list)
+        ip_stats[ip]['blocked'] = False
+        ip_stats[ip]['last_seen'] = 0
+        if 'targets' in ip_stats[ip]:
+            ip_stats[ip]['targets'] = defaultdict(list)
+        print(f"🔄 Reset statistics for IP: {ip}")
+
+def get_local_ips():
+    local_ips = set()
+    try:
+        hostname = socket.gethostname()
+        local_ips.add(socket.gethostbyname(hostname))
+        local_ips.update(ip[4][0] for ip in socket.getaddrinfo(hostname, None))
+    except Exception as e:
+        print(f"Warning: Could not get local IPs: {e}")
+    return local_ips
+
+def unblock_all_ips():
+    if not blocked_ips and not blocked_ranges:
+        return "🟢 No IPs or ranges are currently blocked"
+
+    try:
+        # Flush both ipsets
+        subprocess.run(['ipset', 'flush', CONFIG['IPSET_NAME']], check=True)
+        subprocess.run(['ipset', 'flush', CONFIG['IPSET_RANGE_NAME']], check=True)
+        
+        # Clear our records
+        blocked_ips.clear()
+        blocked_ranges.clear()
+        
+        # Reset all stats
+        for ip in list(ip_stats.keys()):
+            reset_ip_stats(ip)
+        
+        save_state()
+        
+        result_message = "✅ Successfully unblocked all IPs and ranges"
+        print(result_message)
+        send_telegram_message(result_message, force=True)
+        return result_message
+    except subprocess.CalledProcessError as e:
+        error_msg = f"❌ Failed to unblock all IPs: {e}"
+        print(error_msg)
+        send_telegram_message(error_msg, force=True)
+        return error_msg
+
+def unblock_old_ips():
+    while True:
+        time.sleep(60)
+        current_time = time.time()
+        expired_ips = []
+        expired_ranges = []
+        
+        for ip, block_time in list(blocked_ips.items()):
+            if current_time - block_time > CONFIG['BLOCK_DURATION']:
+                expired_ips.append(ip)
+        
+        for network_str, block_time in list(blocked_ranges.items()):
+            if current_time - block_time > CONFIG['BLOCK_DURATION']:
+                expired_ranges.append(network_str)
+        
+        for ip in expired_ips:
+            print(f"⏰ Auto-unblocking expired IP: {ip}")
+            unblock_ip(ip)
+        
+        for network_str in expired_ranges:
+            print(f"⏰ Auto-unblocking expired range: {network_str}")
+            unblock_ip_range(network_str)
+
+def save_state():
+    try:
+        state_data = {**blocked_ips, **blocked_ranges}
+        with open(CONFIG['STATE_FILE'], 'w') as f:
+            json.dump(state_data, f, indent=2)
+    except Exception as e:
+        print(f"Error saving state file: {e}")
+
+def cleanup():
+    print("🧹 Cleaning up blocked IPs...")
+    try:
+        # Flush ipsets but keep the structures
+        subprocess.run(['ipset', 'flush', CONFIG['IPSET_NAME']], check=True)
+        subprocess.run(['ipset', 'flush', CONFIG['IPSET_RANGE_NAME']], check=True)
+        
+        # Clear our own records
+        blocked_ips.clear()
+        blocked_ranges.clear()
+        
+        print("✅ Cleared all blocked IPs and ranges from ipsets")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Error during cleanup: {e}")
+
+def identify_protocol(line):
+    line = line.lower()
+    
+    if 'flags [s]' in line:
+        return 'TCP_SYN'
+    elif 'flags [.]' in line:
+        return 'TCP_ACK'
+    elif 'flags [p.]' in line:
+        return 'TCP_PUSH'
+    elif 'flags [f]' in line:
+        return 'TCP_FIN'
+    elif 'flags [r]' in line:
+        return 'TCP_RST'
+    elif 'icmp' in line:
+        if 'icmp echo request' in line:
+            return 'ICMP_ECHO'
+        elif 'icmp echo reply' in line:
+            return 'ICMP_REPLY'
+        return 'ICMP'
+    elif 'udp' in line:
+        return 'UDP'
+    elif 'http' in line or 'get /' in line or 'post /' in line or 'host:' in line:
+        return 'HTTP'
+    elif 'dns' in line:
+        return 'DNS'
+    return None
+
+def detect_flood(ip, proto, stats):
+    if proto == 'TCP_ACK':
+        return False
+        
+    now = time.time()
+    stats['timestamps'].append(now)
+    stats['timestamps'] = [t for t in stats['timestamps'] if now - t <= 1.0]
+    
+    if proto == 'UDP':
+        return False
+    
+    # Skip flood detection if any target port is in bypass list or >10000
+    if 'targets' in stats:
+        for proto_targets in stats['targets'].values():
+            for _, port in proto_targets:
+                port_num = int(port)
+                if port_num > 10000 or port_num in CONFIG['BYPASS_PORTS']:
+                    return False
+    
+    flood_detected = False
+    
+    if proto.startswith('TCP_SYN'):
+        if len(stats['timestamps']) > CONFIG['SYN_FLOOD_THRESHOLD']:
+            stats['score'] += 50
+            flood_detected = True
+    elif proto.startswith('TCP_PUSH'):
+        if len(stats['timestamps']) > CONFIG['TCP_PUSH_THRESHOLD']:
+            stats['score'] += 40
+            flood_detected = True
+    elif proto.startswith('ICMP'):
+        if len(stats['timestamps']) > CONFIG['ICMP_FLOOD_THRESHOLD']:
+            stats['score'] += 30
+            flood_detected = True
+    elif proto == 'UDP':
+        if len(stats['timestamps']) > CONFIG['UDP_FLOOD_THRESHOLD']:
+            stats['score'] += 25
+            flood_detected = True
+    elif proto == 'HTTP':
+        if len(stats['timestamps']) > CONFIG['HTTP_REQUEST_THRESHOLD']:
+            stats['score'] += 20
+            flood_detected = True
+    
+    if flood_detected:
+        print(f"🚨 FLOOD DETECTED from {ip} ({proto}) - {len(stats['timestamps'])} requests/sec")
+    
+    return flood_detected
+
+def update_ip_score(ip, proto, line):
+    is_whitelisted, matching_network = is_ip_whitelisted(ip)
+    if is_whitelisted:
+        return
+        
+    if ip_stats[ip]['blocked'] or proto is None:
+        return
+        
+    if proto == 'TCP_ACK':
+        return
+        
+    now = time.time()
+    stats = ip_stats[ip]
+    delta = now - stats['last_seen']
+    stats['last_seen'] = now
+    stats['counts'][proto] += 1
+    stats['timestamps'].append(now)
+    stats['protocols'][proto].append(now)
+    
+    # Extract target port if available
+    bypass_port = False
+    try:
+        target_match = re.search(r'IP \d+\.\d+\.\d+\.\d+(?:\.\d+)? > (\d+\.\d+\.\d+\.\d+)\.(\d+)', line)
+        if target_match:
+            target_ip = target_match.group(1)
+            target_port = int(target_match.group(2))
+            if target_port > 10000 or target_port in CONFIG['BYPASS_PORTS']:
+                bypass_port = True
+            if 'targets' not in stats:
+                stats['targets'] = defaultdict(list)
+            stats['targets'][proto].append((target_ip, target_port))
+    except Exception as e:
+        print(f"Error extracting target info: {e}")
+    
+    # Skip scoring if this is bypass port traffic
+    if bypass_port:
+        return
+    
+    # Check rate limit before other checks
+    rate_limit_exceeded = check_rate_limit(ip, proto, stats)
+    
+    for p in stats['protocols']:
+        stats['protocols'][p] = [t for t in stats['protocols'][p] if now - t <= 60]
+        if 'targets' in stats and p in stats['targets']:
+            recent_timestamps = [t for t in stats['protocols'][p] if now - t <= 60]
+            stats['targets'][p] = stats['targets'][p][-len(recent_timestamps):]
+    
+    if delta > 0:
+        decay = math.exp(-delta / CONFIG['DECAY_RATE'])
+        stats['score'] = decay * stats['score'] + 1.0
+    else:
+        stats['score'] += 1.0
+    
+    detect_flood(ip, proto, stats)
+    
+    total_requests = sum(stats['counts'].values())
+    
+    should_block = (
+        stats['score'] > CONFIG['SCORE_THRESHOLD'] or
+        total_requests > CONFIG['COUNT_THRESHOLD'] or
+        (stats['score'] > CONFIG['SCORE_THRESHOLD'] * 0.5 and total_requests > CONFIG['COUNT_THRESHOLD'] * 0.5) or
+        rate_limit_exceeded  # Block immediately if rate limit exceeded
+    )
+    
+    if should_block and not bypass_port:  # Only block if not bypass port traffic
+        print(f"🎯 Attempting to block {ip} - Score: {stats['score']:.1f}, Requests: {total_requests}")
+        block_ip(ip)
+
+def monitor():
+    print("🛡️ Starting IP protection monitor...")
+    print(f"📊 Thresholds - Score: {CONFIG['SCORE_THRESHOLD']}, Count: {CONFIG['COUNT_THRESHOLD']}")
+    print(f"🛡️ Protecting {len(whitelisted_networks)} whitelisted networks")
+    
+    try:
+        proc = subprocess.Popen(
+            ['tcpdump', '-n', '-l', '-i', 'any'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True,
+            bufsize=0
+)
+        
+        for line in iter(proc.stdout.readline, ''):
+            try:
+                proto = identify_protocol(line)
+                match = re.search(r'IP (\d+\.\d+\.\d+\.\d+)', line)
+                if match:
+                    ip = match.group(1)
+                    update_ip_score(ip, proto, line)
+            except Exception as e:
+                print(f"Error processing line: {str(e)}")
+    except Exception as e:
+        print(f"Monitor error: {str(e)}")
+        send_telegram_message(f"🚨 Monitor Error: {str(e)}", force=True)
+    finally:
+        if 'proc' in locals():
+            proc.terminate()
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in CONFIG['OWNER_ID']:
+        await update.message.reply_text("❌ You are not authorized to use this bot.")
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("🛡️ View Blocked IPs", callback_data='view_blocked')],
+        [InlineKeyboardButton("🔓 Unblock IP", callback_data='unblock_ip')],
+        [InlineKeyboardButton("🗑️ Unblock All IPs", callback_data='unblock_all')],
+        [InlineKeyboardButton("📊 System Info", callback_data='system_info')],
+        [InlineKeyboardButton("📈 Top Threats", callback_data='top_threats')],
+        [InlineKeyboardButton("🛡️ View Whitelist", callback_data='view_whitelist')],
+        [InlineKeyboardButton("⏱️ Check Response Time", callback_data='check_response')]  # New button
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text('🛡️ IP Protection Bot Menu:', reply_markup=reply_markup)
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.from_user.id not in CONFIG['OWNER_ID']:
+        await query.edit_message_text(text="❌ You are not authorized to use this bot.")
+        return
+    
+    elif query.data == 'check_response':
+        # Record start time
+        start_time = time.time()
+        
+        # Send initial message
+        await query.message.reply_text("⏱️ Measuring response time...")
+        
+        # Calculate round-trip time in milliseconds
+        end_time = time.time()
+        response_time = (end_time - start_time) * 1000  # Convert to milliseconds
+        
+        # Send results as a new message
+        await query.message.reply_text(
+                text=f"⏱️ Telegram Response Time Results:\n\n"
+                     f"📡 Round-trip: {response_time:.2f} ms\n"
+                     f"🕒 Measured at: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        return
+    
+    if query.data == 'view_blocked':
+        if not blocked_ips and not blocked_ranges:
+            await query.edit_message_text(text="🟢 No IPs or ranges are currently blocked.")
+            return
+        
+        message = "🚨 Blocked Items:\n\n"
+        
+        if blocked_ranges:
+            message += "🔴 Blocked Ranges:\n"
+            for network_str, block_time in blocked_ranges.items():
+                time_left = CONFIG['BLOCK_DURATION'] - (time.time() - block_time)
+                hours = int(time_left // 3600)
+                minutes = int((time_left % 3600) // 60)
+                
+                message += f"🌐 {network_str}\n"
+                message += f"⏳ Time left: {hours}h {minutes}m\n\n"
+        
+        if blocked_ips:
+            message += "🔴 Blocked IPs:\n"
+            for ip, block_time in blocked_ips.items():
+                time_left = CONFIG['BLOCK_DURATION'] - (time.time() - block_time)
+                hours = int(time_left // 3600)
+                minutes = int((time_left % 3600) // 60)
+                
+                stats = ip_stats[ip]
+                message += f"• {ip}\n"
+                message += f"  ⏳ Time left: {hours}h {minutes}m\n"
+                message += f"  📊 Score: {stats['score']:.1f}\n"
+                message += f"  📈 Requests: {sum(stats['counts'].values())}\n"
+                message += f"  📌 Protocols: {', '.join(stats['counts'].keys())}\n\n"
+        
+        await query.edit_message_text(text=message)
+        
+    elif query.data == 'unblock_ip':
+        if not blocked_ips and not blocked_ranges:
+            await query.edit_message_text(text="🟢 No IPs or ranges are currently blocked.")
+            return
+            
+        keyboard = []
+        
+        if blocked_ranges:
+            keyboard.append([InlineKeyboardButton("🌐 Unblock Ranges", callback_data='unblock_ranges')])
+        
+        if blocked_ips:
+            keyboard.append([InlineKeyboardButton("🔓 Unblock IPs", callback_data='unblock_individual_ips')])
+        
+        keyboard.append([InlineKeyboardButton("🗑️ Unblock All", callback_data='unblock_all')])
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='back')])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(text="Select what to unblock:", reply_markup=reply_markup)
+    
+    elif query.data == 'unblock_ranges':
+        if not blocked_ranges:
+            await query.edit_message_text(text="🟢 No ranges are currently blocked.")
+            return
+            
+        keyboard = []
+        for network_str in blocked_ranges.keys():
+            keyboard.append([InlineKeyboardButton(network_str, callback_data=f'unblock_range_{network_str}')])
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='back')])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(text="Select range to unblock:", reply_markup=reply_markup)
+    
+    elif query.data == 'unblock_individual_ips':
+        if not blocked_ips:
+            await query.edit_message_text(text="🟢 No IPs are currently blocked.")
+            return
+            
+        keyboard = []
+        for ip in blocked_ips.keys():
+            keyboard.append([InlineKeyboardButton(ip, callback_data=f'unblock_{ip}')])
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='back')])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(text="Select IP to unblock:", reply_markup=reply_markup)
+    
+    elif query.data.startswith('unblock_range_'):
+        network_str = query.data.split('_', 2)[2]
+        success = unblock_ip_range(network_str)
+        if success:
+            await query.edit_message_text(text=f"✅ Range {network_str} has been unblocked.")
+        else:
+            await query.edit_message_text(text=f"❌ Failed to unblock range {network_str}.")
+    
+    elif query.data.startswith('unblock_') and query.data != 'unblock_all':
+        ip = query.data.split('_', 1)[1]
+        success = unblock_ip(ip)
+        if success:
+            await query.edit_message_text(text=f"✅ IP {ip} has been unblocked and reset.")
+        else:
+            await query.edit_message_text(text=f"❌ Failed to unblock IP {ip}.")
+    
+    elif query.data == 'unblock_all':
+        await query.edit_message_text(text="🔄 Processing unblock all IPs/ranges... Please wait...")
+        
+        def run_unblock_all():
+            try:
+                result = unblock_all_ips()
+                asyncio.run_coroutine_threadsafe(
+                    query.message.reply_text(result), 
+                    bot_loop
+                )
+            except Exception as e:
+                error_msg = f"❌ Error during unblock all operation: {str(e)}"
+                asyncio.run_coroutine_threadsafe(
+                    query.message.reply_text(error_msg), 
+                    bot_loop
+                )
+        
+        threading.Thread(target=run_unblock_all, daemon=True).start()
+    
+    elif query.data == 'system_info':
+        message = "📊 System Information:\n\n"
+        message += f"🛡️ Currently blocking: {len(blocked_ips)} IPs and {len(blocked_ranges)} ranges\n"
+        message += f"👁️ Monitoring: {len(ip_stats)} unique IPs\n"
+        message += f"🛡️ Whitelisted networks: {len(whitelisted_networks)}\n"
+        message += f"⚙️ Block duration: {CONFIG['BLOCK_DURATION']/3600:.1f} hours\n"
+        message += f"🔔 Score threshold: {CONFIG['SCORE_THRESHOLD']}\n"
+        message += f"📌 Count threshold: {CONFIG['COUNT_THRESHOLD']}\n"
+        message += f"⏱️ Rate limit: {CONFIG['RATE_LIMIT_THRESHOLD']} req/{CONFIG['RATE_LIMIT_WINDOW']}s\n"
+        message += f"🌐 Range block threshold: {CONFIG['RANGE_BLOCK_THRESHOLD']} IPs from same /24\n"
+        message += f"📡 Telegram rate limit: {CONFIG['MAX_TELEGRAM_NOTIFICATIONS']} messages per minute\n"
+        message += f"🕐 System time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        await query.edit_message_text(text=message)
+    
+    elif query.data == 'top_threats':
+        if not ip_stats:
+            await query.edit_message_text(text="📊 No threat data available.")
+            return
+        
+        sorted_ips = sorted(ip_stats.items(), key=lambda x: x[1]['score'], reverse=True)[:10]
+        
+        message = "📈 Top 10 Threat IPs:\n\n"
+        for i, (ip, stats) in enumerate(sorted_ips, 1):
+            status = "🔴 BLOCKED" if stats['blocked'] else "🟡 MONITORING"
+            
+            is_whitelisted, matching_network = is_ip_whitelisted(ip)
+            if is_whitelisted:
+                status += f" (🛡️ WHITELISTED: {matching_network})"
+            
+            message += f"{i}. {ip} {status}\n"
+            message += f"   Score: {stats['score']:.1f}\n"
+            message += f"   Requests: {sum(stats['counts'].values())}\n\n"
+        
+        await query.edit_message_text(text=message)
+    
+    elif query.data == 'view_whitelist':
+        message = "🛡️ Whitelisted Networks:\n\n"
+        for i, network in enumerate(whitelisted_networks, 1):
+            message += f"{i}. {network}\n"
+        
+        message += f"\n📊 Total: {len(whitelisted_networks)} networks/IPs"
+        await query.edit_message_text(text=message)
+    
+    elif query.data == 'back':
+        keyboard = [
+            [InlineKeyboardButton("🛡️ View Blocked IPs", callback_data='view_blocked')],
+            [InlineKeyboardButton("🔓 Unblock IP", callback_data='unblock_ip')],
+            [InlineKeyboardButton("🗑️ Unblock All IPs", callback_data='unblock_all')],
+            [InlineKeyboardButton("📊 System Info", callback_data='system_info')],
+            [InlineKeyboardButton("📈 Top Threats", callback_data='top_threats')],
+            [InlineKeyboardButton("🛡️ View Whitelist", callback_data='view_whitelist')],
+            [InlineKeyboardButton("⏱️ Check Response Time", callback_data='check_response')]  # New button
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(text='🛡️ IP Protection Bot Menu:', reply_markup=reply_markup)
+
+async def run_bot():
+    global bot_loop
+    bot_loop = asyncio.get_event_loop()
+    
+    application = Application.builder().token(CONFIG['TELEGRAM_TOKEN']).build()
+    
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    
+    while True:
+        await asyncio.sleep(1)
+
+def main():
+    setup()
+    
+    threading.Thread(target=unblock_old_ips, daemon=True).start()
+    
+    import atexit
+    atexit.register(cleanup)
+    
+    def run_bot_thread():
+        asyncio.run(run_bot())
+    
+    threading.Thread(target=run_bot_thread, daemon=True).start()
+    
+    time.sleep(5)
+    
+    send_telegram_message("🛡️ IP Protection System Started!\n📡 Monitoring network traffic...", force=True)
+    
+    monitor()
+
+if __name__ == '__main__':
+    main()

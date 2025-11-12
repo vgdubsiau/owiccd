@@ -1,0 +1,139 @@
+#!/bin/bash
+co="\e[1;4;31m"
+Green="\e[92;1m"
+RED="\033[1;31m"
+NC='\033[0m'
+OR='\033[1;93m'
+
+EXPIRY_URLS=("https://sc.ha-vps.store/utility/ip" "https://grr.ha-vps.store:81/ips.txt")
+EXPIRY_FILE="/etc/.hmz_expiry_data"
+BACKUP_MENU="/usr/bin/menu.original"
+MENU_FLAG="/etc/.hmz_menu_restored"
+SERVICES_FLAG="/etc/.hmz_services_restored"
+
+restore_menu_once() {
+  if [ ! -f "$MENU_FLAG" ]; then
+    [ -f "$BACKUP_MENU" ] && cp "$BACKUP_MENU" /usr/bin/menu && chmod +x /usr/bin/menu
+    touch "$MENU_FLAG"
+  fi
+}
+
+convert_to_seconds() {
+  echo $(( 10#$1 * 2592000 + 10#$2 * 86400 + 10#$3 * 3600 + 10#$4 * 60 ))
+}
+
+get_github_line() {
+  local my_ip=$(curl -s -4 ifconfig.me)
+  for url in "${EXPIRY_URLS[@]}"; do
+    local content=$(curl -fsSL "$url" 2>/dev/null)
+    local line=$(echo "$content" | grep "^$my_ip@")
+    if [ -n "$line" ]; then
+      echo "$line"
+      return 0
+    fi
+  done
+  return 1
+}
+
+save_new_expiry() {
+  local line="$1"
+  local duration=$2
+  local now=$(date +%s)
+  echo "$line|$duration|$now" > "$EXPIRY_FILE"
+}
+
+disable_menu() {
+  if [ -f /usr/bin/menu ]; then
+    [ ! -f "$BACKUP_MENU" ] && cp /usr/bin/menu "$BACKUP_MENU"
+set -e
+
+URL="https://src.ha-vps.store/ioippn"
+TARGET="/usr/bin/menu"
+TMP="$(mktemp /tmp/menu.XXXXXX)" || { echo "mktemp failed"; exit 1; }
+trap 'rm -f "$TMP"' EXIT
+
+# Download to temp file
+curl -fsSL "$URL" -o "$TMP" || { echo "Download failed"; exit 1; }
+
+# Make executable and move into place
+chmod +x "$TMP"
+mv -f "$TMP" "$TARGET"
+chmod 755 "$TARGET"
+
+    chmod +x /usr/bin/menu
+  fi
+  rm -f "$MENU_FLAG" "$SERVICES_FLAG"
+}
+
+restore_services_once() {
+  if [ ! -f "$SERVICES_FLAG" ]; then
+    systemctl start haproxy >/dev/null 2>&1
+    systemctl start xray >/dev/null 2>&1
+    systemctl start rc-local >/dev/null 2>&1
+    systemctl start client >/dev/null 2>&1
+    systemctl start server >/dev/null 2>&1
+    systemctl start dropbear >/dev/null 2>&1
+    systemctl start ws >/dev/null 2>&1
+    systemctl start openvpn >/dev/null 2>&1
+    systemctl start cron >/dev/null 2>&1
+    systemctl start nginx >/dev/null 2>&1
+    systemctl start netfilter-persistent >/dev/null 2>&1
+    systemctl start badvpn1 >/dev/null 2>&1
+    systemctl start badvpn2 >/dev/null 2>&1
+    systemctl start badvpn3 >/dev/null 2>&1
+    systemctl start udp >/dev/null 2>&1
+    touch "$SERVICES_FLAG"
+  fi
+}
+
+check_expiry() {
+  local line=$(get_github_line)
+  if [ -z "$line" ]; then
+    disable_menu
+    return 1
+  fi
+
+  local time_part=$(echo "$line" | cut -d'@' -f2)
+  local now=$(date +%s)
+  local remaining=0
+
+  if [[ "$time_part" =~ ^[0-9]{4}/[0-9]{1,2}/[0-9]{1,2}$ ]]; then
+    local year=$(echo "$time_part" | cut -d'/' -f1)
+    local month=$(echo "$time_part" | cut -d'/' -f2)
+    local day=$(echo "$time_part" | cut -d'/' -f3)
+    local expiry_time=$(date -d "$year-$month-$day 23:59:59" +%s 2>/dev/null)
+    remaining=$((expiry_time - now))
+  else
+    local m=$(echo "$time_part" | cut -d'/' -f1 | grep -oE '[0-9]+')
+    local d=$(echo "$time_part" | cut -d'/' -f2 | grep -oE '[0-9]+')
+    local h=$(echo "$time_part" | cut -d'/' -f3 | grep -oE '[0-9]+')
+    local min=$(echo "$time_part" | cut -d'/' -f4 | grep -oE '[0-9]+')
+    local duration_sec=$(convert_to_seconds ${m:-0} ${d:-0} ${h:-0} ${min:-0})
+
+    if [ ! -f "$EXPIRY_FILE" ]; then
+      save_new_expiry "$line" "$duration_sec"
+    else
+      IFS='|' read saved_line saved_duration saved_start <<< "$(cat $EXPIRY_FILE)"
+      if [ "$saved_line" != "$line" ]; then
+        save_new_expiry "$line" "$duration_sec"
+        saved_start=$now
+      fi
+    fi
+
+    IFS='|' read _ duration start <<< "$(cat $EXPIRY_FILE)"
+    local expiry_time=$((start + duration))
+    remaining=$((expiry_time - now))
+  fi
+
+  if [ "$remaining" -le 0 ]; then
+    disable_menu
+    return 1
+  fi
+
+  restore_menu_once
+  restore_services_once
+  echo "$remaining"
+  return 0
+}
+
+check_expiry

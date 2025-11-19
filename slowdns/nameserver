@@ -1,5 +1,5 @@
 #!/bin/bash
-REPO="https://github.com/vxb-hmz/sxwe23rys/raw/refs/heads/main/slowdns/"
+REPO="https://github.com/vxb-hmz/sxwe23rys/raw/refs/heads/main/"
 ns_domain_cloudflare() {
     DOMAIN="ha-vps.store"
     DAOMIN=$(cat /etc/xray/domain)

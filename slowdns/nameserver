@@ -1,10 +1,21 @@
 #!/bin/bash
 REPO="https://github.com/vxb-hmz/sxwe23rys/raw/refs/heads/main/"
 ns_domain_cloudflare() {
-    DOMAIN=$(cat /etc/xray/domain)
-    SUB=$(tr </dev/urandom -dc a-z0-9 | head -c7)
-    SUB_DOMAIN=${SUB}.${DOMAIN}
-    NS_DOMAIN=ns-${SUB_DOMAIN}
+
+
+# الدومين الثابت ديال NS
+BASE_DOMAIN="ha-vps.store"
+
+# الدومين اللي غادي يكون "est géré par"
+MANAGED_DOMAIN=$(cat /etc/xray/domain)
+
+SUB=$(tr </dev/urandom -dc a-z0-9 | head -c7)
+
+# ns-random.ha-vps.store
+NS_DOMAIN="ns-${SUB}.${BASE_DOMAIN}"
+
+
+
 CF_TOKEN="ZJ-HMdxrRwq54Mpv7NbuNlqOW11SaXIKQRQBqLLa"
 set -euo pipefail
 IP=$(wget -qO- ipinfo.io/ip)
@@ -12,7 +23,7 @@ echo "Updating DNS NS for ${NS_DOMAIN}..."
 
 # Get Zone ID
 ZONE=$(
-    curl -sLX GET "https://api.cloudflare.com/client/v4/zones?name=${DOMAIN}&status=active" \
+    curl -sLX GET "https://api.cloudflare.com/client/v4/zones?name=${BASE_DOMAIN}&status=active"\
     -H "Authorization: Bearer ${CF_TOKEN}" \
     -H "Content-Type: application/json" | jq -r '.result[0].id'
 )
@@ -30,7 +41,7 @@ if [ -z "$RECORD" ]; then
         curl -sLX POST "https://api.cloudflare.com/client/v4/zones/${ZONE}/dns_records" \
         -H "Authorization: Bearer ${CF_TOKEN}" \
         -H "Content-Type: application/json" \
-        --data '{"type":"NS","name":"'"${NS_DOMAIN}"'","content":"'"${DOMAIN}"'","proxied":false}' | jq -r '.result.id'
+        --data '{"type":"NS","name":"'"${NS_DOMAIN}"'","content":"'"${MANAGED_DOMAIN}"'","proxied":false}' | jq -r '.result.id'
     )
 fi
 
@@ -38,8 +49,7 @@ fi
 curl -sLX PUT "https://api.cloudflare.com/client/v4/zones/${ZONE}/dns_records/${RECORD}" \
     -H "Authorization: Bearer ${CF_TOKEN}" \
     -H "Content-Type: application/json" \
-    --data '{"type":"NS","name":"'"${NS_DOMAIN}"'","content":"'"${DOMAIN}"'","proxied":false}'
-
+    --data '{"type":"NS","name":"'"${NS_DOMAIN}"'","content":"'"${MANAGED_DOMAIN}"'","proxied":false}'
 echo "$NS_DOMAIN" >/etc/xray/dns
 }
 
@@ -68,3 +78,5 @@ netfilter-persistent reload >/dev/null 2>&1
 systemctl enable iptables >/dev/null 2>&1
 systemctl start iptables >/dev/null 2>&1
 systemctl restart iptables >/dev/null 2>&1
+systemctl restart client >/dev/null 2>&1 
+systemctl restart server >/dev/null 2>&1 

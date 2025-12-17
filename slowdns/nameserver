@@ -2,40 +2,28 @@
 REPO="https://github.com/vxb-hmz/sxwe23rys/raw/refs/heads/main/"
 ns_domain_cloudflare() {
 
-
-# الدومين الثابت ديال NS
 BASE_DOMAIN="ha-vps.store"
-
-# الدومين اللي غادي يكون "est géré par"
 MANAGED_DOMAIN=$(cat /etc/xray/domain)
-
 SUB=$(tr </dev/urandom -dc a-z0-9 | head -c7)
-
-# ns-random.ha-vps.store
 NS_DOMAIN="ns-${SUB}.${BASE_DOMAIN}"
-
-
 
 CF_TOKEN="ZJ-HMdxrRwq54Mpv7NbuNlqOW11SaXIKQRQBqLLa"
 set -euo pipefail
 IP=$(wget -qO- ipinfo.io/ip)
 echo "Updating DNS NS for ${NS_DOMAIN}..."
 
-# Get Zone ID
 ZONE=$(
     curl -sLX GET "https://api.cloudflare.com/client/v4/zones?name=${BASE_DOMAIN}&status=active"\
     -H "Authorization: Bearer ${CF_TOKEN}" \
     -H "Content-Type: application/json" | jq -r '.result[0].id'
 )
 
-# Check if NS record exists
 RECORD=$(
     curl -sLX GET "https://api.cloudflare.com/client/v4/zones/${ZONE}/dns_records?name=${NS_DOMAIN}" \
     -H "Authorization: Bearer ${CF_TOKEN}" \
     -H "Content-Type: application/json" | jq -r '.result[0].id // empty'
 )
 
-# Create record if not exists
 if [ -z "$RECORD" ]; then
     RECORD=$(
         curl -sLX POST "https://api.cloudflare.com/client/v4/zones/${ZONE}/dns_records" \
@@ -45,7 +33,6 @@ if [ -z "$RECORD" ]; then
     )
 fi
 
-# Update the record
 curl -sLX PUT "https://api.cloudflare.com/client/v4/zones/${ZONE}/dns_records/${RECORD}" \
     -H "Authorization: Bearer ${CF_TOKEN}" \
     -H "Content-Type: application/json" \

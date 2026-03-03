@@ -1,1 +1,17 @@
-.
+cat <<EOF > /etc/systemd/system/removetrial.service
+[Unit]
+Description=Trial Accounts Auto-Delete Bot
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /usr/bin/removesshtrial
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload && systemctl enable removetrial && systemctl start removetrial

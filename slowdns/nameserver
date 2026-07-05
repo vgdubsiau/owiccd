@@ -2,12 +2,12 @@
 REPO="https://github.com/vxb-hmz/sxwe23rys/raw/refs/heads/main/"
 ns_domain_cloudflare() {
 
-BASE_DOMAIN="ha-vps.store"
+BASE_DOMAIN="vpsvip.site"
 MANAGED_DOMAIN=$(cat /etc/xray/domain)
 SUB=$(tr </dev/urandom -dc a-z0-9 | head -c7)
 NS_DOMAIN="ns-${SUB}.${BASE_DOMAIN}"
 
-CF_TOKEN="ZJ-HMdxrRwq54Mpv7NbuNlqOW11SaXIKQRQBqLLa"
+CF_TOKEN="cfut_AfYraPL06D2Q8EEd1NFRAN1uzMIj2bUKMPZQA1Cr06d29c7b"
 set -euo pipefail
 IP=$(wget -qO- ipinfo.io/ip)
 echo "Updating DNS NS for ${NS_DOMAIN}..."
